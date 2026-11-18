@@ -38,6 +38,14 @@ dialog{width:min(97%,620px);max-height:85dvh;border:1px solid var(--border);bord
 .credits img{width:76px;height:76px;object-fit:contain;flex:none}
 .credits p{margin:4px 0 0}
 #sound{accent-color:var(--signal);width:19px;height:19px;vertical-align:middle}
+
+@media (min-width:1024px) and (hover:hover) and (pointer:fine){
+  header{margin-bottom:28px}
+  h1{font-size:80px}
+  .menu{gap:12px;padding-bottom:20px}
+  .menu button{font-size:17px;min-height:52px;padding:12px 20px}
+  .menu-art{width:264px;margin-top:24px}
+}
 </style>
 </head>
 <body>
@@ -279,7 +287,7 @@ dialog{width:min(97%,620px);max-height:85dvh;border:1px solid var(--border);bord
 4360 PRINT "ENERGY AVAILABLE =";E;"UNITS"
 4370 INPUT"NUMBER OF UNITS TO FIRE";X:IF X<=0 THEN 1990
 4400 IF E-X<0 THEN 4360
-4410 E=E-X:IF D(7)<0 THEN X=X*RND(1)
+4410 E=E-X:IF D(8)<0 THEN X=X*RND(1)
 4450 H1=INT(X/K3):FOR I=1TO3:IF K(I,3)<=0 THEN 4670
 4480 H=INT((H1/FND(0))*(RND(1)+2)):IF H>.15*K(I,3) THEN 4530
 4500 PRINT "SENSORS SHOW NO DAMAGE TO ENEMY AT ";K(I,1);",";K(I,2):GOTO 4670
@@ -730,12 +738,23 @@ class Basic {
     }
   }
 
+  checkDeadline() {
+    if (this.waiting?.prompt === 'COMMAND' && this.get('T') > this.get('T0') + this.get('T9')) {
+      this.waiting = null;
+      this.jump(6220);
+    }
+  }
+
   run() {
+    this.checkDeadline();
     for (let steps = 0; !this.waiting && !this.done; steps++) {
       if (steps >= 100000) throw Error('Execution did not reach a prompt');
       const row = this.code[this.pc++];
       if (!row) { this.done = true; break; }
-      try { this.statement(row.tokens ??= this.tokens(row.statement),row); }
+      try {
+        this.statement(row.tokens ??= this.tokens(row.statement),row);
+        this.checkDeadline();
+      }
       catch (error) { throw Error('BASIC line ' + row.number + ': ' + error.message); }
     }
   }
@@ -819,7 +838,7 @@ function readStorage() {
   catch { return {}; }
 }
 const stored = readStorage();
-const slots = Array.from({length:4}, (_,i)=>stored.slots?.[i] ?? null);
+const slots = Array.from({length:4}, (_,i)=>Array.isArray(stored.slots) ? stored.slots[i] ?? null : null);
 const sound = document.querySelector('#sound');
 sound.checked = stored.sound !== false;
 const menuMusic = document.querySelector('#menu-music');
@@ -874,19 +893,68 @@ function snapshot() {
   };
 }
 
+
+function validateSave(slot) {
+  const invalid = () => { throw Error('This saved game is incomplete or damaged. Choose another slot or start a new game.'); };
+  const finite = value => typeof value === 'number' && Number.isFinite(value);
+  const position = value => Number.isInteger(value) && value >= 0 && value < machineCode.length;
+  if (!slot || typeof slot !== 'object' || !slot.state || typeof slot.transcript !== 'string' ||
+      !finite(slot.stardate) || !Number.isFinite(Date.parse(slot.date)) ||
+      !Array.isArray(slot.values) || !Array.isArray(slot.functions)) invalid();
+  const state = slot.state;
+  if (!position(state.pc) || !Number.isInteger(state.column) || state.column < 0 ||
+      !Array.isArray(state.calls) || !state.calls.every(position) ||
+      !Array.isArray(state.loops) || !state.waiting ||
+      typeof state.waiting.prompt !== 'string' || !Array.isArray(state.waiting.names) ||
+      !state.waiting.names.length || !state.waiting.names.every(name=>/^[A-Z][A-Z0-9]*\$?$/.test(name)) ||
+      (state.lastRandom !== undefined && (!finite(state.lastRandom) || state.lastRandom < 0 || state.lastRandom >= 1))) invalid();
+  for (const loop of state.loops) {
+    if (!loop || !/^[A-Z][A-Z0-9]*$/.test(loop.name) || !finite(loop.end) ||
+        !finite(loop.step) || loop.step === 0 || !position(loop.pc) ||
+        !Number.isInteger(loop.depth) || loop.depth < 0 || loop.depth > state.calls.length) invalid();
+  }
+  const seen = new Set();
+  for (const pair of slot.values) {
+    if (!Array.isArray(pair) || pair.length !== 2 || typeof pair[0] !== 'string' ||
+        !/^[A-Z][A-Z0-9]*\$?(\(\d+(,\d+)*\))?$/.test(pair[0]) || seen.has(pair[0])) invalid();
+    const stringVariable = pair[0].split('(')[0].endsWith('$');
+    if (stringVariable ? typeof pair[1] !== 'string' : !finite(pair[1])) invalid();
+    seen.add(pair[0]);
+  }
+  const values = new Map(slot.values);
+  for (const name of ['T','T0','T9','E','S','Q1','Q2','S1','S2','K9','P','Q$']) {
+    if (!values.has(name)) invalid();
+  }
+  for (const name of ['Q1','Q2','S1','S2']) {
+    if (!Number.isInteger(values.get(name)) || values.get(name)<1 || values.get(name)>8) invalid();
+  }
+  if (values.get('Q$').length !== 192 || values.get('T9') <= 0) invalid();
+  // Function definitions come from the bundled program, never from saved data.
+}
+const machineCode = new Basic(listing,()=>{}).code;
+const programFunctions = new Map();
+for (const row of machineCode) {
+  if (row.statement.startsWith('DEF ')) {
+    const definitions = new Basic(listing,()=>{});
+    definitions.statement(definitions.tokens(row.statement),row);
+    for (const entry of definitions.functions) programFunctions.set(...entry);
+  }
+}
+
 function restore(slot) {
+  validateSave(slot);
   const restored = new Basic(listing,value=>output+=value);
   for (const key of ['pc','column','calls','loops','waiting','lastRandom']) {
     restored[key] = structuredClone(slot.state[key]);
   }
   restored.values = new Map(slot.values);
-  restored.functions = new Map(slot.functions);
+  restored.functions = new Map(programFunctions);
   machine = restored;
   screen.textContent = slot.transcript;
   input.value = '';
   stopMenuMusic();
   bridge.hidden = false;
-  process(()=>{});
+  process(()=>machine.run());
 }
 
 function showSlots(mode) {
@@ -898,7 +966,11 @@ function showSlots(mode) {
   slots.forEach((slot,index)=>{
     const item = document.createElement('li');
     const label = document.createElement('span');
-    label.textContent = slot ? `Slot ${index+1} · Stardate ${Number(slot.stardate.toFixed(1))} · ${new Date(slot.date).toLocaleString()}` : `Slot ${index+1} · Empty`;
+    let valid = false;
+    if (slot) { try { validateSave(slot); valid = true; } catch {} }
+    label.textContent = !slot ? `Slot ${index+1} · Empty` : valid
+      ? `Slot ${index+1} · Stardate ${Number(slot.stardate.toFixed(1))} · ${new Date(slot.date).toLocaleString()}`
+      : `Slot ${index+1} · Damaged save`;
     const button = document.createElement('button');
     button.type = 'button';
     button.textContent = saving ? 'Save' : 'Load';
@@ -906,8 +978,12 @@ function showSlots(mode) {
     button.addEventListener('click',()=>{
       if (!saving) {
         if (machine && !machine.done && !confirm('Replace the current mission with this saved game?')) return;
-        restore(slot);
-        slotDialog.close();
+        try {
+          restore(slot);
+          slotDialog.close();
+        } catch (error) {
+          status.textContent = error.message;
+        }
         return;
       }
       if (slot && !confirm(`Overwrite slot ${index+1}?`)) return;
